@@ -1,0 +1,20 @@
+server:
+  port: 8082
+
+database:
+  mongodb:
+    uri: "mongodb://localhost:27017"
+    database: "cursor_im"
+  mysql:
+    dsn: "root:123456@tcp(127.0.0.1:3306)/im?charset=utf8mb4&parseTime=True&loc=Local"
+
+jwt:
+  secret: "your-secret-key"
+  expire: 24  # 24小时
+
+redis:
+  host: "127.0.0.1"
+  port: 6379
+  password: ""  # 如果没有密码，保持为空
+  db: 0
+
