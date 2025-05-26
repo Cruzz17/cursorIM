@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket 消息测试</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .section { margin: 20px 0; padding: 15px; border: 1px solid #ddd; }
+        .input-group { margin: 10px 0; }
+        label { display: inline-block; width: 120px; }
+        input, textarea { width: 300px; padding: 5px; }
+        button { padding: 8px 15px; margin: 5px; }
+        .status { font-weight: bold; }
+        .online { color: green; }
+        .offline { color: red; }
+        .messages { height: 300px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px; background: #f9f9f9; }
+        .message { margin: 5px 0; padding: 5px; background: white; border-radius: 3px; }
+        .sent { background: #e3f2fd; }
+        .received { background: #f3e5f5; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>WebSocket 消息测试</h1>
+        
+        <div class="section">
+            <h3>连接状态</h3>
+            <div class="input-group">
+                <label>Token:</label>
+                <input type="text" id="token" placeholder="JWT Token">
+            </div>
+            <div class="input-group">
+                <button onclick="connect()">连接</button>
+                <button onclick="disconnect()">断开</button>
+                <span id="status" class="status offline">离线</span>
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>发送消息</h3>
+            <div class="input-group">
+                <label>接收者ID:</label>
+                <input type="text" id="recipientId" placeholder="接收者用户ID">
+            </div>
+            <div class="input-group">
+                <label>消息内容:</label>
+                <input type="text" id="messageContent" placeholder="消息内容">
+            </div>
+            <div class="input-group">
+                <label>会话ID:</label>
+                <input type="text" id="conversationId" placeholder="会话ID (可选)">
+            </div>
+            <div class="input-group">
+                <button onclick="sendMessage()">发送消息</button>
+                <button onclick="sendPing()">发送Ping</button>
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>消息记录</h3>
+            <button onclick="clearMessages()">清空记录</button>
+            <div id="messages" class="messages"></div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let currentUserId = null;
+
+        function addMessage(text, type = '') {
+            const messagesDiv = document.getElementById('messages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${type}`;
+            messageDiv.innerHTML = `<strong>[${new Date().toLocaleTimeString()}]</strong> ${text}`;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function connect() {
+            const token = document.getElementById('token').value;
+            if (!token) {
+                alert('请输入JWT Token');
+                return;
+            }
+
+            // 解析JWT Token获取用户ID
+            try {
+                const payload = JSON.parse(atob(token.split('.')[1]));
+                currentUserId = payload.user_id;
+                addMessage(`解析Token成功，用户ID: ${currentUserId}`, 'system');
+            } catch (e) {
+                addMessage('Token格式错误', 'error');
+                return;
+            }
+
+            const wsUrl = `ws://localhost:8082/api/ws?token=${encodeURIComponent(token)}&t=${Date.now()}`;
+            addMessage(`尝试连接: ${wsUrl}`, 'system');
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = function() {
+                document.getElementById('status').textContent = '在线';
+                document.getElementById('status').className = 'status online';
+                addMessage('WebSocket连接已建立!', 'system');
+            };
+
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                const messageText = `收到消息: ${JSON.stringify(data, null, 2)}`;
+                addMessage(messageText, 'received');
+            };
+
+            ws.onclose = function(event) {
+                document.getElementById('status').textContent = '离线';
+                document.getElementById('status').className = 'status offline';
+                addMessage(`WebSocket连接已关闭: ${event.code} ${event.reason}`, 'system');
+            };
+
+            ws.onerror = function(error) {
+                addMessage(`WebSocket错误: ${error}`, 'error');
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+
+        function sendMessage() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket未连接');
+                return;
+            }
+
+            const recipientId = document.getElementById('recipientId').value;
+            const content = document.getElementById('messageContent').value;
+            const conversationId = document.getElementById('conversationId').value;
+
+            if (!recipientId || !content) {
+                alert('请填写接收者ID和消息内容');
+                return;
+            }
+
+            const message = {
+                id: Date.now().toString(),
+                type: 'message',
+                sender_id: currentUserId,
+                recipient_id: recipientId,
+                content: content,
+                timestamp: Math.floor(Date.now() / 1000),
+                conversation_id: conversationId || `temp_conv_${currentUserId}_${recipientId}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage(`发送消息: ${JSON.stringify(message, null, 2)}`, 'sent');
+            
+            // 清空输入
+            document.getElementById('messageContent').value = '';
+        }
+
+        function sendPing() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket未连接');
+                return;
+            }
+
+            const pingMessage = {
+                type: 'ping',
+                timestamp: Math.floor(Date.now() / 1000)
+            };
+
+            ws.send(JSON.stringify(pingMessage));
+            addMessage(`发送Ping: ${JSON.stringify(pingMessage)}`, 'sent');
+        }
+
+        function clearMessages() {
+            document.getElementById('messages').innerHTML = '';
+        }
+
+        // 页面加载时从localStorage恢复token
+        window.onload = function() {
+            const savedToken = localStorage.getItem('token');
+            if (savedToken) {
+                document.getElementById('token').value = savedToken;
+            }
+        };
+
+        // 保存token到localStorage
+        document.getElementById('token').addEventListener('change', function() {
+            localStorage.setItem('token', this.value);
+        });
+    </script>
+</body>
+</html> 

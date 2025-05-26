@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>连接调试测试</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .section { margin: 20px 0; padding: 15px; border: 1px solid #ddd; display: inline-block; width: 45%; vertical-align: top; }
+        .status { font-weight: bold; }
+        .online { color: green; }
+        .offline { color: red; }
+        .messages { height: 200px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px; background: #f9f9f9; font-size: 12px; }
+        .message { margin: 5px 0; padding: 3px; background: white; border-radius: 3px; }
+        button { padding: 5px 10px; margin: 2px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>连接调试测试 - 验证多连接问题</h1>
+        
+        <div class="section">
+            <h3>连接1 (用户A)</h3>
+            <div>
+                <label>Token:</label>
+                <input type="text" id="token1" style="width: 200px;">
+            </div>
+            <div>
+                <button onclick="connect(1)">连接</button>
+                <button onclick="disconnect(1)">断开</button>
+                <span id="status1" class="status offline">离线</span>
+            </div>
+            <div>
+                <label>消息:</label>
+                <input type="text" id="msg1" style="width: 150px;">
+                <button onclick="sendMessage(1)">发送</button>
+            </div>
+            <div id="messages1" class="messages"></div>
+        </div>
+
+        <div class="section">
+            <h3>连接2 (用户B)</h3>
+            <div>
+                <label>Token:</label>
+                <input type="text" id="token2" style="width: 200px;">
+            </div>
+            <div>
+                <button onclick="connect(2)">连接</button>
+                <button onclick="disconnect(2)">断开</button>
+                <span id="status2" class="status offline">离线</span>
+            </div>
+            <div>
+                <label>消息:</label>
+                <input type="text" id="msg2" style="width: 150px;">
+                <button onclick="sendMessage(2)">发送</button>
+            </div>
+            <div id="messages2" class="messages"></div>
+        </div>
+
+        <div style="clear: both; margin-top: 20px;">
+            <h3>说明</h3>
+            <p>1. 分别在两个输入框中输入不同用户的JWT Token</p>
+            <p>2. 点击"连接"建立WebSocket连接</p>
+            <p>3. 在任一侧发送消息，观察另一侧是否能收到</p>
+            <p>4. 如果第二个用户连接后，第一个用户不能收到消息，则说明存在连接覆盖问题</p>
+        </div>
+    </div>
+
+    <script>
+        let connections = {
+            1: { ws: null, userId: null },
+            2: { ws: null, userId: null }
+        };
+
+        function addMessage(connId, text, type = '') {
+            const messagesDiv = document.getElementById(`messages${connId}`);
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${type}`;
+            messageDiv.innerHTML = `<strong>[${new Date().toLocaleTimeString()}]</strong> ${text}`;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function connect(connId) {
+            const token = document.getElementById(`token${connId}`).value;
+            if (!token) {
+                alert('请输入JWT Token');
+                return;
+            }
+
+            // 解析JWT Token获取用户ID
+            try {
+                const payload = JSON.parse(atob(token.split('.')[1]));
+                connections[connId].userId = payload.user_id;
+                addMessage(connId, `解析Token成功，用户ID: ${payload.user_id}`, 'system');
+            } catch (e) {
+                addMessage(connId, 'Token格式错误', 'error');
+                return;
+            }
+
+            const wsUrl = `ws://localhost:8082/api/ws?token=${encodeURIComponent(token)}&t=${Date.now()}`;
+            addMessage(connId, `尝试连接: ${wsUrl}`, 'system');
+
+            connections[connId].ws = new WebSocket(wsUrl);
+
+            connections[connId].ws.onopen = function() {
+                document.getElementById(`status${connId}`).textContent = '在线';
+                document.getElementById(`status${connId}`).className = 'status online';
+                addMessage(connId, 'WebSocket连接已建立!', 'system');
+            };
+
+            connections[connId].ws.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    const messageText = `收到: ${data.type} - ${data.content || '无内容'}`;
+                    addMessage(connId, messageText, 'received');
+                } catch (e) {
+                    addMessage(connId, `收到原始消息: ${event.data}`, 'received');
+                }
+            };
+
+            connections[connId].ws.onclose = function(event) {
+                document.getElementById(`status${connId}`).textContent = '离线';
+                document.getElementById(`status${connId}`).className = 'status offline';
+                addMessage(connId, `WebSocket连接已关闭: ${event.code} ${event.reason}`, 'system');
+            };
+
+            connections[connId].ws.onerror = function(error) {
+                addMessage(connId, `WebSocket错误: ${error}`, 'error');
+            };
+        }
+
+        function disconnect(connId) {
+            if (connections[connId].ws) {
+                connections[connId].ws.close();
+                connections[connId].ws = null;
+            }
+        }
+
+        function sendMessage(connId) {
+            if (!connections[connId].ws || connections[connId].ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket未连接');
+                return;
+            }
+
+            const content = document.getElementById(`msg${connId}`).value;
+            if (!content) {
+                alert('请输入消息内容');
+                return;
+            }
+
+            // 找到另一个连接的用户ID作为接收者
+            let recipientId = null;
+            for (let otherId in connections) {
+                if (otherId != connId && connections[otherId].userId) {
+                    recipientId = connections[otherId].userId;
+                    break;
+                }
+            }
+
+            if (!recipientId) {
+                alert('找不到接收者，请确保另一个连接已建立');
+                return;
+            }
+
+            const message = {
+                id: Date.now().toString(),
+                type: 'message',
+                sender_id: connections[connId].userId,
+                recipient_id: recipientId,
+                content: content,
+                timestamp: Math.floor(Date.now() / 1000),
+                conversation_id: `test_conv_${connections[connId].userId}_${recipientId}`
+            };
+
+            connections[connId].ws.send(JSON.stringify(message));
+            addMessage(connId, `发送给 ${recipientId}: ${content}`, 'sent');
+            
+            // 清空输入
+            document.getElementById(`msg${connId}`).value = '';
+        }
+
+        // 页面加载时从localStorage恢复token
+        window.onload = function() {
+            const savedToken1 = localStorage.getItem('token1');
+            const savedToken2 = localStorage.getItem('token2');
+            if (savedToken1) document.getElementById('token1').value = savedToken1;
+            if (savedToken2) document.getElementById('token2').value = savedToken2;
+        };
+
+        // 保存token到localStorage
+        document.getElementById('token1').addEventListener('change', function() {
+            localStorage.setItem('token1', this.value);
+        });
+        document.getElementById('token2').addEventListener('change', function() {
+            localStorage.setItem('token2', this.value);
+        });
+    </script>
+</body>
+</html> 

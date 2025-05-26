@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package protocol;
+
+option go_package = "cursorIM/internal/protocol/pb";
+
+// 消息类型枚举
+enum MessageType {
+  MESSAGE_TYPE_UNKNOWN = 0;
+  MESSAGE_TYPE_TEXT = 1;
+  MESSAGE_TYPE_IMAGE = 2;
+  MESSAGE_TYPE_FILE = 3;
+  MESSAGE_TYPE_AUDIO = 4;
+  MESSAGE_TYPE_VIDEO = 5;
+  MESSAGE_TYPE_PING = 6;
+  MESSAGE_TYPE_PONG = 7;
+  MESSAGE_TYPE_STATUS = 8;
+  MESSAGE_TYPE_COMMAND = 9;
+  MESSAGE_TYPE_RESPONSE = 10;
+  MESSAGE_TYPE_ERROR = 11;
+}
+
+// 消息状态枚举
+enum MessageStatus {
+  MESSAGE_STATUS_UNKNOWN = 0;
+  MESSAGE_STATUS_SENT = 1;
+  MESSAGE_STATUS_DELIVERED = 2;
+  MESSAGE_STATUS_READ = 3;
+  MESSAGE_STATUS_FAILED = 4;
+}
+
+// 错误信息
+message ErrorInfo {
+  string message = 1;
+  string details = 2;
+}
+
+// 主消息结构
+message Message {
+  // 协议元信息
+  string version = 1;
+  MessageType type = 2;
+  int32 status_code = 3;
+  string error_code = 4;
+  string request_id = 5;
+
+  // 消息基本信息
+  string id = 6;
+  string sender_id = 7;
+  string recipient_id = 8;
+  string content = 9;
+  int64 timestamp = 10;
+  string conversation_id = 11;
+  bool is_group = 12;
+  string group_id = 13;
+  MessageStatus status = 14;
+  bool handled_by_local = 15;
+
+  // 错误信息
+  ErrorInfo error = 16;
+
+  // 扩展元数据
+  map<string, string> metadata = 17;
+
+  // 媒体文件信息（用于图片、音频、视频等）
+  MediaInfo media_info = 18;
+}
+
+// 媒体文件信息
+message MediaInfo {
+  string file_name = 1;
+  string file_type = 2;
+  int64 file_size = 3;
+  string file_url = 4;
+  string thumbnail_url = 5;
+  int32 width = 6;
+  int32 height = 7;
+  int32 duration = 8; // 音频/视频时长（秒）
+}
+
+// 批量消息（用于离线消息推送等）
+message MessageBatch {
+  repeated Message messages = 1;
+  int32 total_count = 2;
+  bool has_more = 3;
+}
+
+// 用户状态消息
+message UserStatus {
+  string user_id = 1;
+  bool online = 2;
+  int64 last_seen = 3;
+  string device_type = 4;
+}
+
+// 会话信息
+message ConversationInfo {
+  string id = 1;
+  string name = 2;
+  bool is_group = 3;
+  repeated string participant_ids = 4;
+  string last_message = 5;
+  int64 last_time = 6;
+  int32 unread_count = 7;
+}
+
+// 群组信息
+message GroupInfo {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  string owner_id = 4;
+  repeated string member_ids = 5;
+  int64 created_at = 6;
+  int64 updated_at = 7;
+}
+
+// 认证消息
+message AuthMessage {
+  string token = 1;
+  string device_id = 2;
+  string device_type = 3;
+  string app_version = 4;
+}
+
+// 认证响应
+message AuthResponse {
+  bool success = 1;
+  string user_id = 2;
+  string session_id = 3;
+  string error_message = 4;
+} 
