@@ -7,6 +7,7 @@ import (
 
 	"cursorIM/internal/database"
 	"cursorIM/internal/model"
+
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -82,12 +83,23 @@ func (s *ChatService) CreateConversation(ctx context.Context, userID, recipientI
 	tx := s.db.Begin()
 
 	// 1. 创建会话
+	now := time.Now()
 	conversation := model.Conversation{
-		ID:        uuid.New().String(),
-		Name:      name,
+		ID:   uuid.New().String(),
+		Name: name,
+		Type: func() int {
+			if isGroup {
+				return 1
+			} else {
+				return 0
+			}
+		}(),
 		IsGroup:   isGroup,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		LastMsg:   "",
+		LastTime:  now, // 确保初始化LastTime字段
+		Unread:    0,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 
 	if err := tx.Create(&conversation).Error; err != nil {

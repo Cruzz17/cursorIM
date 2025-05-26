@@ -2,38 +2,51 @@ package status
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"log"
 	"sync"
 	"time"
-	
+
 	"cursorIM/internal/redisclient"
+
 	"github.com/go-redis/redis/v8"
 )
 
+// UserStatus 表示用户状态
+type UserStatus struct {
+	UserID      string    `json:"user_id"`
+	Online      bool      `json:"online"`
+	LastActive  time.Time `json:"last_active"`
+	Connections struct {
+		HTTP      bool `json:"http"`
+		WebSocket bool `json:"websocket"`
+		TCP       bool `json:"tcp"`
+	} `json:"connections"`
+}
+
 // Manager 统一用户状态管理
 type Manager struct {
-	redisClient *redis.Client
+	redisClient  *redis.Client
 	redisEnabled bool
-	statusCache map[string]*UserStatus // 本地状态缓存
-	mutex sync.RWMutex
-	ctx context.Context
+	statusCache  map[string]*UserStatus // 本地状态缓存
+	mutex        sync.RWMutex
+	ctx          context.Context
 }
 
 // NewManager 创建状态管理器
 func NewManager(ctx context.Context) *Manager {
 	return &Manager{
-		redisClient: redisclient.GetRedisClient(),
+		redisClient:  redisclient.GetRedisClient(),
 		redisEnabled: redisclient.IsRedisEnabled(),
-		statusCache: make(map[string]*UserStatus),
-		ctx: ctx,
+		statusCache:  make(map[string]*UserStatus),
+		ctx:          ctx,
 	}
 }
 
 // UpdateUserStatus 更新用户状态
 func (m *Manager) UpdateUserStatus(userID string, connectionType string, online bool) error {
 	now := time.Now()
-	
+
 	// 更新本地缓存
 	m.mutex.Lock()
 	var status *UserStatus
@@ -43,81 +56,81 @@ func (m *Manager) UpdateUserStatus(userID string, connectionType string, online 
 		status.Online = online
 	} else {
 		status = &UserStatus{
-			UserID: userID,
-			Online: online,
+			UserID:     userID,
+			Online:     online,
 			LastActive: now,
 		}
 		m.statusCache[userID] = status
 	}
-	
+
 	// 更新连接类型
-	if connectionType == "http" {
+	switch connectionType {
+	case "http":
 		status.Connections.HTTP = online
-	} else if connectionType == "websocket" {
+	case "websocket":
 		status.Connections.WebSocket = online
-	} else if connectionType == "tcp" {
+	case "tcp":
 		status.Connections.TCP = online
 	}
 	m.mutex.Unlock()
-	
+
 	// 如果Redis可用，同步到Redis
 	if m.redisEnabled {
 		return m.syncToRedis(userID, status)
 	}
-	
+
 	return nil
 }
 
 // syncToRedis 将状态同步到Redis
 func (m *Manager) syncToRedis(userID string, status *UserStatus) error {
-	// 实现Redis同步逻辑
 	statusKey := fmt.Sprintf("user:%s:status", userID)
 	connKey := fmt.Sprintf("user:%s:connections", userID)
 	lastActiveKey := fmt.Sprintf("user:%s:last_active", userID)
-	
+
 	// 序列化状态
 	data, err := json.Marshal(status)
 	if err != nil {
 		return fmt.Errorf("序列化用户状态失败: %w", err)
 	}
-	
+
 	// 使用Redis事务保证原子性
 	pipe := m.redisClient.Pipeline()
 	pipe.Set(m.ctx, statusKey, data, 10*time.Minute)
 	pipe.Set(m.ctx, lastActiveKey, status.LastActive.Unix(), 10*time.Minute)
-	
+
 	// 设置连接状态
 	if status.Connections.HTTP {
-		pipe.HSet(m.ctx, connKey, "http", "1") 
+		pipe.HSet(m.ctx, connKey, "http", "1")
 	} else {
 		pipe.HDel(m.ctx, connKey, "http")
 	}
-	
+
 	if status.Connections.WebSocket {
 		pipe.HSet(m.ctx, connKey, "websocket", "1")
 	} else {
 		pipe.HDel(m.ctx, connKey, "websocket")
 	}
-	
+
 	if status.Connections.TCP {
 		pipe.HSet(m.ctx, connKey, "tcp", "1")
 	} else {
 		pipe.HDel(m.ctx, connKey, "tcp")
 	}
-	
+
 	// 如果在线，添加到在线用户集合
 	if status.Online {
 		pipe.SAdd(m.ctx, "online_users", userID)
 	} else {
 		pipe.SRem(m.ctx, "online_users", userID)
 	}
-	
+
 	// 执行事务
 	_, err = pipe.Exec(m.ctx)
 	if err != nil {
 		return fmt.Errorf("同步用户状态到Redis失败: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -134,7 +147,7 @@ func (m *Manager) GetUserStatus(userID string) (*UserStatus, error) {
 		}
 	}
 	m.mutex.RUnlock()
-	
+
 	// 查询Redis
 	if m.redisEnabled {
 		statusKey := fmt.Sprintf("user:%s:status", userID)
@@ -149,11 +162,11 @@ func (m *Manager) GetUserStatus(userID string) (*UserStatus, error) {
 			}
 		}
 	}
-	
+
 	// 默认返回离线状态
 	return &UserStatus{
-		UserID: userID,
-		Online: false,
+		UserID:     userID,
+		Online:     false,
 		LastActive: time.Now().Add(-1 * time.Hour), // 1小时前
 	}, nil
 }
@@ -167,18 +180,47 @@ func (m *Manager) IsUserOnline(userID string) (bool, error) {
 	return status.Online, nil
 }
 
-// 添加UserStatus相关字段
-func (s *UserStatus) Connections {
-	// 确保连接类型完整
-	if s.Connections == nil {
-		s.Connections = struct {
-			HTTP      bool `json:"http"`
-			WebSocket bool `json:"websocket"`
-			TCP       bool `json:"tcp"`
-		}{
-			HTTP:      false,
-			WebSocket: false,
-			TCP:       false,
+// MarkUserOffline 标记用户为离线
+func (m *Manager) MarkUserOffline(userID string) error {
+	return m.UpdateUserStatus(userID, "all", false)
+}
+
+// GetOnlineUsers 获取所有在线用户
+func (m *Manager) GetOnlineUsers() ([]string, error) {
+	if !m.redisEnabled {
+		// 如果Redis不可用，从本地缓存获取
+		m.mutex.RLock()
+		defer m.mutex.RUnlock()
+
+		var onlineUsers []string
+		for userID, status := range m.statusCache {
+			if status.Online && time.Since(status.LastActive) < 10*time.Minute {
+				onlineUsers = append(onlineUsers, userID)
+			}
+		}
+		return onlineUsers, nil
+	}
+
+	// 从Redis获取在线用户列表
+	users, err := m.redisClient.SMembers(m.ctx, "online_users").Result()
+	if err != nil {
+		return nil, fmt.Errorf("获取在线用户列表失败: %w", err)
+	}
+
+	return users, nil
+}
+
+// CleanupExpiredStatuses 清理过期的用户状态
+func (m *Manager) CleanupExpiredStatuses() error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	now := time.Now()
+	for userID, status := range m.statusCache {
+		if now.Sub(status.LastActive) > 10*time.Minute {
+			delete(m.statusCache, userID)
 		}
 	}
-} 
+
+	return nil
+}

@@ -3,10 +3,10 @@ package router
 import (
 	"cursorIM/internal/chat"
 	"cursorIM/internal/connection"
+	"cursorIM/internal/group"
 	"cursorIM/internal/middleware"
 	"cursorIM/internal/server"
 	"cursorIM/internal/user"
-	"cursorIM/internal/ws"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -31,7 +31,7 @@ func (w bodyLogWriter) Write(b []byte) (int, error) {
 }
 
 // SetupRouter 配置所有路由
-func SetupRouter(hub *ws.Hub, connMgr connection.ConnectionManager, messageService *chat.MessageService) *gin.Engine {
+func SetupRouter(connMgr connection.ConnectionManager, messageService *chat.MessageService) *gin.Engine {
 	r := gin.Default()
 
 	// CORS 配置
@@ -92,8 +92,9 @@ func SetupRouter(hub *ws.Hub, connMgr connection.ConnectionManager, messageServi
 		}
 	})
 
-	// 添加 TCP 风格的 WebSocket 处理器 - 放在顶层路由方便客户端访问
-	r.GET("/tcp", server.WebSocketHandler(connMgr, messageService, true)) // TCP风格WebSocket
+	// 静态文件服务 - 为测试页面提供支持
+	r.StaticFile("/test_websocket.html", "./test_websocket.html")
+	r.StaticFile("/debug_connections.html", "./debug_connections.html")
 
 	// API 路由
 	api := r.Group("/api")
@@ -137,6 +138,28 @@ func SetupRouter(hub *ws.Hub, connMgr connection.ConnectionManager, messageServi
 				auth.GET(route, user.GetFriends)
 			}
 
+			// ----- 群组相关 -----
+			// 创建群组
+			auth.POST("/group/create", group.CreateGroup)
+
+			// 邀请用户入群
+			auth.POST("/group/:groupId/invite", group.InviteUser)
+
+			// 退出群组
+			auth.POST("/group/:groupId/exit", group.ExitGroup)
+
+			// 获取群成员列表
+			auth.GET("/group/:groupId/members", group.GetGroupMembers)
+
+			// 获取用户所在群组列表
+			auth.GET("/groups", group.GetUserGroups)
+
+			// 更新群名称
+			auth.PUT("/group/:groupId/name", group.UpdateGroupName)
+
+			// 解散群组
+			auth.DELETE("/group/:groupId", group.DeleteGroup)
+
 			// ----- 会话相关 -----
 
 			// 获取会话列表 - 支持多种路径
@@ -167,7 +190,7 @@ func SetupRouter(hub *ws.Hub, connMgr connection.ConnectionManager, messageServi
 				log.Printf("获取用户 %s 和 %s 之间的消息", userID, otherUserID)
 
 				msgService := chat.NewMessageService()
-				messages, err := msgService.GetMessages(c.Request.Context(), userID.(string), otherUserID, 50)
+				messages, err := msgService.GetPrivateMessages(c.Request.Context(), userID.(string), otherUserID, 50)
 				if err != nil {
 					log.Printf("获取消息失败: %v", err)
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "获取消息失败"})
@@ -175,6 +198,23 @@ func SetupRouter(hub *ws.Hub, connMgr connection.ConnectionManager, messageServi
 				}
 
 				log.Printf("找到用户 %s 和 %s 之间的 %d 条消息", userID, otherUserID, len(messages))
+				c.JSON(http.StatusOK, messages)
+			})
+
+			// 获取群组消息
+			auth.GET("/messages/group/:group_id", func(c *gin.Context) {
+				groupID := c.Param("group_id")
+				log.Printf("获取群组 %s 的消息", groupID)
+
+				msgService := chat.NewMessageService()
+				messages, err := msgService.GetGroupMessages(c.Request.Context(), groupID, 50)
+				if err != nil {
+					log.Printf("获取群组消息失败: %v", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "获取群组消息失败"})
+					return
+				}
+
+				log.Printf("找到群组 %s 的 %d 条消息", groupID, len(messages))
 				c.JSON(http.StatusOK, messages)
 			})
 

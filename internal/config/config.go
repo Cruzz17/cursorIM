@@ -55,7 +55,6 @@ func Init() error {
 
 		return nil
 	}
-	defer f.Close()
 
 	decoder := yaml.NewDecoder(f)
 	err = decoder.Decode(&GlobalConfig)

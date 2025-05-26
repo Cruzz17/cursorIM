@@ -16,6 +16,7 @@ import (
 	"cursorIM/internal/protocol"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -201,16 +202,23 @@ func processMessages(conn connection.Connection, userID string, connMgr connecti
 	// Handle incoming messages based on connection type
 	switch wsConn := conn.(type) {
 	case *connection.WebSocketConnection:
+		// Start writing in a separate goroutine so it doesn't block reading
+		go wsConn.StartWriting()
+
+		// StartReading blocks, so we call it last
 		wsConn.StartReading(func(msg *protocol.Message) {
 			handleMessage(connMgr, messageService, userID, msg)
 		})
-		wsConn.StartWriting()
 	case *connection.TCPConnection:
 		tcpConn := conn.(*connection.TCPConnection)
+
+		// Start writing in a separate goroutine so it doesn't block reading
+		go tcpConn.StartWriting()
+
+		// StartReading blocks, so we call it last
 		tcpConn.StartReading(func(msg *protocol.Message) {
 			handleMessage(connMgr, messageService, userID, msg)
 		})
-		tcpConn.StartWriting()
 	}
 }
 
@@ -272,14 +280,10 @@ func handleMessage(connMgr connection.ConnectionManager, messageService *chat.Me
 			log.Printf("警告: 消息缺少会话ID，尝试生成临时会话ID")
 			// 为一对一消息生成临时会话ID
 			if message.RecipientID != "" {
-				participantIDs := []string{userID, message.RecipientID}
-				// 确保ID排序是一致的以生成唯一的会话ID
-				if userID > message.RecipientID {
-					participantIDs[0] = message.RecipientID
-					participantIDs[1] = userID
-				}
-				message.ConversationID = fmt.Sprintf("temp_conv_%s_%s", participantIDs[0], participantIDs[1])
-				log.Printf("为消息生成临时会话ID: %s", message.ConversationID)
+				// 生成一个更短的临时会话ID (使用UUID)
+				tempConvID := uuid.New().String()
+				message.ConversationID = tempConvID
+				log.Printf("为消息生成临时会话ID: %s (用户: %s -> %s)", tempConvID, userID, message.RecipientID)
 			} else {
 				log.Printf("无法为消息生成会话ID，缺少必要信息")
 				return fmt.Errorf("消息缺少会话ID和接收者ID")

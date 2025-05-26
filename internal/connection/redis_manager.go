@@ -12,6 +12,7 @@ import (
 	"cursorIM/internal/model"
 	"cursorIM/internal/protocol"
 	"cursorIM/internal/redisclient"
+	"cursorIM/internal/status"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
@@ -21,52 +22,33 @@ import (
 type RedisConnectionManager struct {
 	redisClient          *redis.Client
 	redisEnabled         bool
-	connections          map[string]map[string]Connection // 用户ID -> 连接类型 -> 连接
-	connectionsByType    map[string]map[string]Connection // 连接类型 -> 用户ID -> 连接
+	connections          map[string]map[string]Connection // 用户ID -> 连接ID -> 连接
+	connectionsByType    map[string]map[string]Connection // 连接类型 -> 用户ID -> 连接 (保留最新连接引用)
 	messageQueueChan     chan *protocol.Message
 	connectionUpdateChan chan struct{}
+	statusManager        *status.Manager // 状态管理器
 	mutex                sync.RWMutex
 	ctx                  context.Context
 	cancel               context.CancelFunc
-}
-
-// GetRedisClient 返回Redis客户端实例，若Redis未启用则返回nil并记录警告
-func (redis *RedisConnectionManager) GetRedisClient() *redis.Client {
-	if !redis.redisEnabled {
-		log.Printf("警告: Redis 未启用，返回nil客户端")
-	}
-	return redis.redisClient
 }
 
 // NewRedisConnectionManager 创建新的 Redis 连接管理器
 func NewRedisConnectionManager() *RedisConnectionManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	var (
-		redisClient  *redis.Client
-		redisEnabled bool
-		connErr      error
-	)
+	// 使用统一的Redis客户端
+	redisClient := redisclient.GetRedisClient()
+	redisEnabled := redisclient.IsRedisEnabled()
 
-	defer func() {
-		if connErr != nil && redisClient != nil {
-			redisClient.Close()
-		}
-	}()
+	// 创建状态管理器
+	statusMgr := status.NewManager(ctx)
 
-	// 获取Redis客户端实例
-	if redisClient = redisclient.GetRedisClient(); redisClient == nil {
-		log.Printf("[Redis] connection disabled: redisclient client not initialized")
-		return createMemoryOnlyManager(ctx, cancel)
+	if !redisEnabled {
+		log.Println("[Redis] running in memory-only mode")
+	} else {
+		log.Printf("[Redis] connection established successfully")
 	}
 
-	// 带重试的连接验证
-	if redisEnabled, connErr = validateRedisConnection(ctx, redisClient); connErr != nil {
-		log.Printf("[Redis] connection disabled: %v", connErr)
-		return createMemoryOnlyManager(ctx, cancel)
-	}
-
-	log.Printf("[Redis] connection established successfully (status: %t)", redisEnabled)
 	return &RedisConnectionManager{
 		redisClient:          redisClient,
 		redisEnabled:         redisEnabled,
@@ -74,37 +56,7 @@ func NewRedisConnectionManager() *RedisConnectionManager {
 		connectionsByType:    make(map[string]map[string]Connection),
 		messageQueueChan:     make(chan *protocol.Message, 1000),
 		connectionUpdateChan: make(chan struct{}, 100),
-		ctx:                  ctx,
-		cancel:               cancel,
-	}
-}
-
-func validateRedisConnection(ctx context.Context, client *redis.Client) (bool, error) {
-	const maxRetries = 3
-	var lastErr error
-
-	for i := 0; i < maxRetries; i++ {
-		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-
-		if _, err := client.Ping(ctx).Result(); err == nil {
-			return true, nil
-		} else {
-			lastErr = err
-			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond) // 指数退避
-		}
-	}
-	return false, fmt.Errorf("connection verification failed after %d attempts: %w", maxRetries, lastErr)
-}
-
-func createMemoryOnlyManager(ctx context.Context, cancel context.CancelFunc) *RedisConnectionManager {
-	log.Println("[Redis] running in memory-only mode")
-	return &RedisConnectionManager{
-		redisEnabled:         false,
-		connections:          make(map[string]map[string]Connection),
-		connectionsByType:    make(map[string]map[string]Connection),
-		messageQueueChan:     make(chan *protocol.Message, 1000),
-		connectionUpdateChan: make(chan struct{}, 100),
+		statusManager:        statusMgr,
 		ctx:                  ctx,
 		cancel:               cancel,
 	}
@@ -114,6 +66,9 @@ func createMemoryOnlyManager(ctx context.Context, cancel context.CancelFunc) *Re
 func (m *RedisConnectionManager) RegisterConnection(userID string, conn Connection) error {
 	connType := conn.GetConnectionType()
 
+	// 生成连接ID
+	connID := fmt.Sprintf("%s_%s_%d", userID, connType, time.Now().UnixNano())
+
 	// 更新本地连接映射
 	m.mutex.Lock()
 
@@ -121,9 +76,9 @@ func (m *RedisConnectionManager) RegisterConnection(userID string, conn Connecti
 	if _, ok := m.connections[userID]; !ok {
 		m.connections[userID] = make(map[string]Connection)
 	}
-	m.connections[userID][connType] = conn
+	m.connections[userID][connID] = conn
 
-	// 初始化类型连接映射
+	// 初始化类型连接映射（保留最新连接引用）
 	if _, ok := m.connectionsByType[connType]; !ok {
 		m.connectionsByType[connType] = make(map[string]Connection)
 	}
@@ -164,6 +119,11 @@ func (m *RedisConnectionManager) RegisterConnection(userID string, conn Connecti
 				log.Printf("添加用户到在线集合失败: %v", err)
 			}
 		}
+	}
+
+	// 更新用户状态为在线
+	if err := m.statusManager.UpdateUserStatus(userID, connType, true); err != nil {
+		log.Printf("更新用户 %s 的在线状态失败: %v", userID, err)
 	}
 
 	// 触发连接更新
@@ -218,13 +178,21 @@ func (m *RedisConnectionManager) sendOfflineMessages(userID string) {
 func (m *RedisConnectionManager) UnregisterConnection(userID string, connType string) error {
 	// 更新本地连接映射
 	m.mutex.Lock()
-	var connToClose Connection
+	var connsToClose []Connection
 
 	if userConns, ok := m.connections[userID]; ok {
-		if conn, ok := userConns[connType]; ok {
-			// 保存连接以便后面关闭（避免在锁内执行可能阻塞的操作）
-			connToClose = conn
-			delete(userConns, connType)
+		// 遍历用户的所有连接，找到匹配类型的连接
+		var connIDsToRemove []string
+		for connID, conn := range userConns {
+			if conn.GetConnectionType() == connType {
+				connsToClose = append(connsToClose, conn)
+				connIDsToRemove = append(connIDsToRemove, connID)
+			}
+		}
+
+		// 删除找到的连接
+		for _, connID := range connIDsToRemove {
+			delete(userConns, connID)
 		}
 
 		if len(userConns) == 0 {
@@ -232,15 +200,18 @@ func (m *RedisConnectionManager) UnregisterConnection(userID string, connType st
 		}
 	}
 
+	// 从类型映射中删除
 	if typeConns, ok := m.connectionsByType[connType]; ok {
 		delete(typeConns, userID)
 	}
 	m.mutex.Unlock()
 
 	// 在锁外安全地关闭连接
-	if connToClose != nil {
-		// 忽略关闭错误，因为连接可能已经关闭
-		_ = connToClose.Close()
+	for _, conn := range connsToClose {
+		if conn != nil {
+			// 忽略关闭错误，因为连接可能已经关闭
+			_ = conn.Close()
+		}
 	}
 
 	// 如果 Redis 启用，从 Redis 中删除连接信息
@@ -262,6 +233,18 @@ func (m *RedisConnectionManager) UnregisterConnection(userID string, connType st
 		err = m.redisClient.SRem(m.ctx, fmt.Sprintf("online_users:%s", connType), userID).Err()
 		if err != nil {
 			log.Printf("从在线集合删除用户失败: %v", err)
+		}
+	}
+
+	// 检查用户是否还有其他连接
+	m.mutex.RLock()
+	hasOtherConns := len(m.connections[userID]) > 0
+	m.mutex.RUnlock()
+
+	// 如果没有其他连接，更新用户状态为离线
+	if !hasOtherConns {
+		if err := m.statusManager.UpdateUserStatus(userID, connType, false); err != nil {
+			log.Printf("更新用户 %s 的离线状态失败: %v", userID, err)
 		}
 	}
 
@@ -301,13 +284,14 @@ func (m *RedisConnectionManager) SendMessage(message *protocol.Message) error {
 			// 使用 Publish 将消息发送到 Redis 频道
 			// PUBLISH 命令是 fire-and-forget，不关心是否有订阅者
 			// 仅当消息未在本地处理时才发布到Redis
-			// 修复代码块闭合问题并增强日志
 			if !message.HandledByLocal {
 				err := m.redisClient.Publish(m.ctx, channel, msgBytes).Err()
 				if err != nil {
+					// 发布失败通常是 Redis 问题，记录日志
 					log.Printf("发布消息到 Redis 频道 %s 失败: %v", channel, err)
+					// 不返回错误，继续流程
 				} else {
-					log.Printf("消息已通过Redis广播到频道 %s", channel)
+					// log.Printf("消息已发布到 Redis 频道 %s", channel) // 可选日志
 				}
 			}
 		}
@@ -473,21 +457,7 @@ func (m *RedisConnectionManager) storeOfflineMessage(message *protocol.Message) 
 
 // checkUserOnline 检查用户是否在线（在任何服务器上）
 func (m *RedisConnectionManager) checkUserOnline(userID string) (bool, error) {
-	if !m.redisEnabled {
-		// 如果 Redis 未启用，只检查本地连接
-		m.mutex.RLock()
-		_, exists := m.connections[userID]
-		m.mutex.RUnlock()
-		return exists, nil
-	}
-
-	// 检查用户是否有任何类型的连接
-	connTypes, err := m.redisClient.SMembers(m.ctx, fmt.Sprintf("user_conns:%s", userID)).Result()
-	if err != nil {
-		return false, err
-	}
-
-	return len(connTypes) > 0, nil
+	return m.statusManager.IsUserOnline(userID)
 }
 
 // Run 启动连接管理器

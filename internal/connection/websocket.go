@@ -140,9 +140,10 @@ func (c *WebSocketConnection) StartReading(msgHandler func(*protocol.Message)) {
 					participantIDs[0] = message.RecipientID
 					participantIDs[1] = c.userID
 				}
-				// 生成一个临时的会话ID
-				message.ConversationID = fmt.Sprintf("temp_conv_%s_%s", participantIDs[0], participantIDs[1])
-				log.Printf("为消息生成临时会话ID: %s", message.ConversationID)
+				// 生成一个更短的临时会话ID (使用UUID)
+				tempConvID := uuid.New().String()
+				message.ConversationID = tempConvID
+				log.Printf("为消息生成临时会话ID: %s (用户: %s -> %s)", tempConvID, c.userID, message.RecipientID)
 			}
 		}
 
@@ -215,11 +216,17 @@ func (c *WebSocketConnection) StartWriting() {
 			}
 
 			c.conn.SetWriteDeadline(time.Now().Add(WriteWait))
+
+			// 详细记录要发送的消息
+			messageJson, _ := json.Marshal(message)
+			log.Printf("🚀 准备发送WebSocket消息到用户 %s: %s", c.userID, string(messageJson))
+
 			// 增加失败重试
 			var err error
 			for i := 0; i < 3; i++ { // 最多重试3次
 				err = c.conn.WriteJSON(message)
 				if err == nil {
+					log.Printf("✅ 成功发送WebSocket消息到用户 %s", c.userID)
 					break
 				}
 				log.Printf("WebSocket写入失败(尝试 %d/3): %v", i+1, err)
@@ -234,7 +241,7 @@ func (c *WebSocketConnection) StartWriting() {
 			}
 
 			if err != nil {
-				log.Printf("WebSocket写入最终失败: %v", err)
+				log.Printf("❌ WebSocket写入最终失败: %v", err)
 				return
 			}
 

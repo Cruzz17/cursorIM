@@ -11,14 +11,13 @@ import (
 	"syscall"
 	"time"
 
-	"cursorIM/internal/chat"
 	"cursorIM/internal/config"
 	"cursorIM/internal/connection"
 	"cursorIM/internal/database"
 	"cursorIM/internal/redisclient"
 	"cursorIM/internal/router"
 	"cursorIM/internal/server"
-	"cursorIM/internal/ws"
+	"cursorIM/internal/service"
 
 	"github.com/gin-gonic/gin"
 )
@@ -55,33 +54,42 @@ func main() {
 		log.Println("Redis 初始化成功")
 	}
 
-	// 创建消息服务
-	messageService := chat.NewMessageService()
-
-	// 创建Redis连接管理器（使用全局配置）
-	connMgr := connection.NewRedisConnectionManager()
-
-	// 设置消息服务的连接管理器
-	messageService.SetConnectionManager(connMgr)
+	// 创建优化的连接管理器（支持协议适配）
+	connMgr := connection.NewOptimizedConnectionManager("server-1", "localhost:8082")
 
 	// 启动连接管理器
-	go connMgr.Run(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go connMgr.Run(ctx)
 
-	// 创建 TCP 服务器
-	tcpServer := server.NewTCPServer(":8083", connMgr, messageService)
-	if err := tcpServer.Start(); err != nil {
-		log.Fatalf("启动 TCP 服务器失败: %v", err)
+	// 创建统一服务管理器
+	serviceMgr := service.NewManager(context.Background(), connMgr)
+
+	// 启动增强的 TCP 服务器（支持 Protobuf 协议）
+	enhancedTCPServer := server.NewEnhancedTCPServer(":8083", connMgr, serviceMgr.GetChatService())
+	if err := enhancedTCPServer.Start(); err != nil {
+		log.Fatalf("启动增强 TCP 服务器失败: %v", err)
 	}
-
-	// 创建 WebSocket Hub
-	hub := ws.NewHub()
+	defer enhancedTCPServer.Stop()
 
 	// 设置 Gin 路由
-	r := router.SetupRouter(hub, connMgr, messageService)
+	r := router.SetupRouter(connMgr, serviceMgr.GetChatService())
 
-	// 启动 HTTP 服务器 (WebSocket)
+	// 添加增强的 WebSocket 路由（支持协议适配）
+	r.GET("/api/ws", server.EnhancedWebSocketHandler(connMgr, serviceMgr.GetChatService(), false))
+	r.GET("/api/ws-tcp", server.EnhancedWebSocketHandler(connMgr, serviceMgr.GetChatService(), true))
+
+	// 启动 HTTP/HTTPS 服务器 (WebSocket)
 	httpServerPort := config.GlobalConfig.Server.Port
 	httpServer := startHTTPServer(r, httpServerPort)
+
+	// 打印协议支持信息
+	log.Println("协议支持:")
+	log.Println("  - Web端: JSON over WebSocket")
+	log.Println("  - App端: Protobuf over TCP/WebSocket")
+	log.Printf("  - WebSocket (JSON): ws://localhost:%d/api/ws", httpServerPort)
+	log.Printf("  - WebSocket (Protobuf): ws://localhost:%d/api/ws-tcp", httpServerPort)
+	log.Println("  - TCP (Protobuf): localhost:8083")
 
 	// 等待退出信号
 	quit := make(chan os.Signal, 1)
@@ -91,16 +99,19 @@ func main() {
 	log.Println("正在关闭服务器...")
 
 	// 关闭 HTTP 服务器
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(ctx); err != nil {
 		log.Fatalf("HTTP 服务器关闭失败: %v", err)
 	}
 
-	// 关闭 TCP 服务器
-	if err := tcpServer.Stop(); err != nil {
-		log.Fatalf("TCP 服务器关闭失败: %v", err)
+	// 关闭增强的 TCP 服务器
+	if err := enhancedTCPServer.Stop(); err != nil {
+		log.Fatalf("增强 TCP 服务器关闭失败: %v", err)
 	}
+
+	// 关闭服务管理器
+	serviceMgr.Shutdown()
 
 	// 关闭连接管理器
 	if err := connMgr.Close(); err != nil {
@@ -110,10 +121,36 @@ func main() {
 	log.Println("服务器已安全关闭")
 }
 
-// startHTTPServer 启动 HTTP 服务器
+// startHTTPServer 启动 HTTP/HTTPS 服务器
 func startHTTPServer(r *gin.Engine, port int) *http.Server {
-	// Fix: Convert port to string with proper format ":port"
 	portStr := ":" + strconv.Itoa(port)
+
+	// 检查是否启用TLS
+	enableTLS := os.Getenv("ENABLE_TLS") == "true"
+	certFile := os.Getenv("TLS_CERT_FILE")
+	keyFile := os.Getenv("TLS_KEY_FILE")
+
+	// 如果没有设置环境变量，使用默认值
+	if certFile == "" {
+		certFile = "./certs/server.crt"
+	}
+	if keyFile == "" {
+		keyFile = "./certs/server.key"
+	}
+
+	// 创建TLS配置
+	tlsConfig := server.NewTLSConfig(certFile, keyFile, enableTLS)
+
+	// 验证证书（如果启用TLS）
+	if enableTLS {
+		if err := tlsConfig.ValidateCertificates(); err != nil {
+			log.Printf("⚠️ TLS证书验证失败: %v", err)
+			log.Printf("💡 提示: 运行 './scripts/generate_certs.sh' 生成开发证书")
+			log.Printf("🔄 回退到HTTP模式...")
+			enableTLS = false
+			tlsConfig = server.NewTLSConfig("", "", false)
+		}
+	}
 
 	srv := &http.Server{
 		Addr:    portStr,
@@ -121,11 +158,22 @@ func startHTTPServer(r *gin.Engine, port int) *http.Server {
 	}
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP 服务器启动失败: %v", err)
+		var err error
+		if enableTLS {
+			log.Printf("🔐 HTTPS服务器已启动，监听端口 %d", port)
+			log.Printf("🌐 访问地址: https://localhost%s", portStr)
+			log.Printf("📄 使用证书: %s", certFile)
+			err = srv.ListenAndServeTLS(certFile, keyFile)
+		} else {
+			log.Printf("🌐 HTTP服务器已启动，监听端口 %d", port)
+			log.Printf("🌐 访问地址: http://localhost%s", portStr)
+			err = srv.ListenAndServe()
+		}
+
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("服务器启动失败: %v", err)
 		}
 	}()
 
-	log.Printf("HTTP 服务器已启动，监听端口 %d", port)
 	return srv
 }
